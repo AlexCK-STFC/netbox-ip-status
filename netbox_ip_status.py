@@ -22,13 +22,13 @@ last_seen = {}
 logger = logging.getLogger('netbox-ip-status')
 
 
-def ping_addresses(netbox, addresses, prefix_mask):
+def ping_addresses(netbox, addresses, prefix_mask, prefix_tenant):
     with Popen(["fping", "-a", "-g", str(addresses)], stdout=PIPE, stderr=PIPE) as fping:
         ips_alive = fping.communicate()[0].decode('utf8').splitlines()
         logger.debug("fping returned: %s", ips_alive)
 
         for address in addresses:
-            process_address(netbox, address, prefix_mask, str(address) in ips_alive)
+            process_address(netbox, address, prefix_mask, str(address) in ips_alive, prefix_tenant)
 
 
 def reverse_lookup(ip):
@@ -93,7 +93,7 @@ def update_tag(address, new_tag):
     return address, updated
 
 
-def add_address(netbox, ipy_address, prefix_mask, rev):
+def add_address(netbox, ipy_address, prefix_mask, rev, prefix_tenant):
     logger.debug("Adding new address %s", ipy_address)
     new_address = {
         "address": ipy_address.strNormal(1) + "/" + prefix_mask,
@@ -102,6 +102,7 @@ def add_address(netbox, ipy_address, prefix_mask, rev):
             {"name": "lastseen:today"}
         ],
         "status": "reserved",
+        "tenant": prefix_tenant,
     }
     if rev is not None:
         new_address["dns_name"] = rev
@@ -110,7 +111,7 @@ def add_address(netbox, ipy_address, prefix_mask, rev):
     last_seen[str(address)] = today
 
 
-def process_address(netbox, ipy_address, prefix_mask, is_alive):
+def process_address(netbox, ipy_address, prefix_mask, is_alive, prefix_tenant):
     logger.debug("processing address %s, is_alive=%s", ipy_address, is_alive)
     ip = ipy_address.strNormal()
     rev_updated = False
@@ -136,7 +137,7 @@ def process_address(netbox, ipy_address, prefix_mask, is_alive):
 
     elif is_alive:
         # The address does not currently exist in Netbox, so lets add a reservation so somebody does not re-use it.
-        add_address(netbox, ipy_address, prefix_mask, rev)
+        add_address(netbox, ipy_address, prefix_mask, rev, prefix_tenant)
 
 
 
@@ -176,7 +177,8 @@ def main():
         logger.info("Scanning prefix %s", prefix)
         prefix_ip_object = IP(prefix.prefix)
         prefix_mask = prefix.prefix.split("/")[1]
-        ping_addresses(netbox, prefix_ip_object, prefix_mask)
+        prefix_tenant = prefix.tenant.id
+        ping_addresses(netbox, prefix_ip_object, prefix_mask, prefix_tenant)
 
     pickle.dump(last_seen, open(config['SCANNER']['LAST_SEEN_DATABASE'], "wb"))
 
