@@ -126,6 +126,11 @@ def process_address(netbox, ipy_address, prefix_mask, is_alive, prefix_tenant):
         new_tag = generate_tag(address, is_alive)
         address, tag_updated = update_tag(address, new_tag)
 
+        # If tenant is not set, default to the prefix tenant
+        # We won't make this a criteria for saving changes to the address though
+        if address.tenant is None:
+            address.tenant = prefix_tenant
+
         # Only update reverse DNS if it changes
         if rev is not None:
             if address.dns_name != rev:
