@@ -131,6 +131,7 @@ dmypy.json
 config.py
 db.pickle
 *.cfg
+netbox_sync*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

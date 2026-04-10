@@ -1,5 +1,3 @@
-#!/bin/env python3
-
 import argparse
 import glob
 import json
@@ -7,21 +5,34 @@ import logging
 import xml.etree.ElementTree as ET
 from configparser import ConfigParser
 from dataclasses import dataclass
-from ipaddress import IPv6Network
+from datetime import datetime
+from ipaddress import IPv6Interface
 from typing import Callable, Generic, Iterator, Optional, TypeVar
 from urllib.parse import urljoin
 
-import coloredlogs
 import pynetbox
 import requests
-from rich import print
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+)
+from rich.table import Table
+from rich.text import Text
 
 
 @dataclass(frozen=True)
 class IPv6Binding:
     hostname: str
     interface: str
-    address: IPv6Network
+    address: IPv6Interface
 
 
 T = TypeVar("T")
@@ -39,50 +50,191 @@ class Profiles(Generic[T]):
         return self._gen_func()
 
 
-class UpdateNetboxIPv6:
-    def __init__(
-        self,
-        source: str,
-        nb_url: str,
-        nb_token: str,
-        archetype: Optional[str],
-        personality: Optional[str],
-    ):
-        self.nb = pynetbox.api(url=nb_url, token=nb_token)
-        self.ipv6_aquilon = set()
-        self.ipv6_netbox = set()
+class RichLogHandler(logging.Handler):
+    """Custom handler to keep the last N log lines with colors for the UI."""
 
+    def __init__(self, level=logging.NOTSET):
+        super().__init__(level)
+        self.logs = []
+        self.level_colors = {
+            "DEBUG": "cyan",
+            "INFO": "green",
+            "WARNING": "yellow",
+            "ERROR": "red",
+            "CRITICAL": "bold red",
+        }
+
+    def emit(self, record):
+        if not record.getMessage():
+            self.logs.append(Text(""))
+            return
+        color = self.level_colors.get(record.levelname, "white")
+        log_entry = Text()
+        log_entry.append(f"{record.asctime.split()[1]} ", style="dim")
+        log_entry.append(f"{record.levelname:7s}", style=color)
+        log_entry.append(f" {record.getMessage()}")
+
+        self.logs.append(log_entry)
+        if len(self.logs) > 10:
+            self.logs.pop(0)
+
+
+class UpdateNetboxIPv6:
+    def __init__(self, source, nb_url, nb_token, archetype, personality, console):
+        self.console = console
+        self.nb = pynetbox.api(url=nb_url, token=nb_token)
+
+        self.stats = {"matches": 0, "mismatches": 0, "errors": 0}
         self._ip_to_device = {}
         self._mac_to_device = {}
         self._device_ips_cache = {}
 
+        # Setup Logging UI
+        self.log_handler = RichLogHandler()
+        logging.getLogger().addHandler(self.log_handler)
+
         if source == "aquilon":
-            self.profiles = self.load_profiles_aquilon(
-                archetype=archetype, personality=personality
-            )
+            self.profiles = self.load_profiles_aquilon(archetype, personality)
         else:
-            self.profiles = self.load_profiles_xml(
-                source, archetype=archetype, personality=personality
+            self.profiles = self.load_profiles_xml(source, archetype, personality)
+
+        self.plan = {
+            "metadata": {
+                "generated_at": datetime.now().isoformat(),
+                "source": source,
+                "archetype": archetype,
+                "personality": personality,
+            },
+            "changes": [],
+        }
+
+    def make_layout(self, progress_table) -> Layout:
+        layout = Layout()
+
+        self.log_panel = Panel(
+            Text(),
+            title="[bold]Live Log Stream[/bold]",
+            border_style="bright_black",
+        )
+
+        layout.split_column(
+            Layout(name="upper", size=10), Layout(self.log_panel, name="lower")
+        )
+
+        layout["upper"].split_row(
+            Layout(name="progress", ratio=2), Layout(name="stats", ratio=1)
+        )
+
+        return layout
+
+    def get_stats_table(self):
+        table = Table.grid(expand=True)
+        table.add_column(style="cyan", justify="right")
+        table.add_column(style="bold")
+        table.add_row("Matches: ", f"[green]{self.stats['matches']}[/green]")
+        table.add_row("Mismatches: ", f"[yellow]{self.stats['mismatches']}[/yellow]")
+        table.add_row("Errors: ", f"[red]{self.stats['errors']}[/red]")
+        return Panel(table, title="Quick Stats", border_style="blue")
+
+    def discover_changes(self):
+        self.progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TaskProgressColumn(),
+            expand=True,
+        )
+
+        layout = self.make_layout(self.progress)
+        self.task_id = self.progress.add_task(
+            "Processing Profiles...", total=len(self.profiles)
+        )
+
+        with Live(layout, refresh_per_second=4, console=self.console):
+            for profile in self.profiles:
+                try:
+                    hostname = (
+                        profile.get("system", {})
+                        .get("network", {})
+                        .get("hostname", "unknown")
+                    )
+                    self.progress.update(
+                        self.task_id, description=f"Checking: [bold]{hostname}[/bold]"
+                    )
+
+                    aq_ips = self.get_ipv6_aquilon(profile)
+                    nb_ips = self.get_ipv6_netbox(profile)
+
+                    if aq_ips or nb_ips:
+                        diffs = aq_ips ^ nb_ips  # Symmetric difference
+                        if not diffs:
+                            self.stats["matches"] += 1
+                            logging.info("Already Matches!")
+                        else:
+                            self.stats["mismatches"] += 1
+                            self._record_diffs(profile, aq_ips, nb_ips)
+
+                except Exception as e:
+                    logging.error(f"Failed profile {profile['filename']}: {e}")
+                    self.stats["errors"] += 1
+
+                # Update UI elements
+                self.progress.advance(self.task_id)
+                log_renderable = Text("\n").join(self.log_handler.logs)
+                self.log_panel.renderable = log_renderable
+
+                layout["stats"].update(self.get_stats_table())
+                layout["progress"].update(
+                    Panel(self.progress, title="Overall Progress")
+                )
+
+    def _record_diffs(self, profile, aq_ips, nb_ips):
+        for binding in aq_ips - nb_ips:
+            logging.warning(f"Mismatch: Missing IP Found: {binding}")
+            self.plan["changes"].append(
+                {
+                    "hostname": binding.hostname,
+                    "interface": binding.interface,
+                    "address": str(binding.address),
+                    "action": "ADD",
+                    "context": {
+                        "netbox_device_id": self._ip_to_device.get(
+                            profile["system"]["network"]["primary_ip"], ""
+                        ),
+                        "is_vm": (
+                            "type" in profile.get("hardware", {})
+                            and profile["hardware"]["type"] == "virtual_machine"
+                        ),
+                    },
+                }
+            )
+        for binding in nb_ips - aq_ips:
+            logging.warning(f"Mismatch: Additional IP Found: {binding}")
+            self.plan["changes"].append(
+                {
+                    "hostname": binding.hostname,
+                    "interface": binding.interface,
+                    "address": str(binding.address),
+                    "action": "REMOVE",
+                    "context": {
+                        "netbox_device_id": self._ip_to_device.get(
+                            profile["system"]["network"]["primary_ip"], ""
+                        ),
+                        "is_vm": (
+                            "type" in profile.get("hardware", {})
+                            and profile["hardware"]["type"] == "virtual_machine"
+                        ),
+                    },
+                }
             )
 
-        for i, profile in enumerate(self.profiles):
-            profile_ipv6_aq = self.get_ipv6_aquilon(profile)
-            profile_ipv6_nb = self.get_ipv6_netbox(profile)
-
-            if profile_ipv6_aq or profile_ipv6_nb:
-                print(f"Profile {i}/{len(self.profiles)}: {profile['filename']}")
-                if profile_ipv6_aq == profile_ipv6_nb:
-                    print("[green]Already Correct![/green]")
-                else:
-                    intersect = profile_ipv6_aq & profile_ipv6_nb
-                    print(
-                        f"[yellow]Difference: {profile_ipv6_aq - profile_ipv6_nb}[/yellow]"
-                    )
-                    if intersect:
-                        print(f"[green]Intersection: {intersect}[/green]")
-                print("========")
-                self.ipv6_aquilon |= profile_ipv6_aq
-                self.ipv6_netbox |= profile_ipv6_nb
+    def export_plan(self, filename="netbox_sync_plan.json"):
+        with open(filename, "w") as f:
+            json.dump(self.plan, f, indent=4)
+        self.console.print(
+            f"\n[bold green]✔[/bold green] Plan exported to [cyan]{filename}[/cyan]"
+        )
 
     def load_profiles_xml(
         self, base_url: str, archetype: Optional[str], personality: Optional[str]
@@ -110,13 +262,17 @@ class UpdateNetboxIPv6:
 
                     if (
                         archetype
+                        and "archetype" in profile["system"]
                         and profile["system"]["archetype"]["name"] != archetype
                     ):
+                        self.progress.advance(self.task_id)
                         continue
                     if (
                         personality
+                        and "personality" in profile["system"]
                         and profile["system"]["personality"]["name"] != personality
                     ):
+                        self.progress.advance(self.task_id)
                         continue
 
                     yield profile
@@ -143,12 +299,19 @@ class UpdateNetboxIPv6:
 
                 profile["filename"] = filename
 
-                if archetype and profile["system"]["archetype"]["name"] != archetype:
+                if (
+                    archetype
+                    and "archetype" in profile["system"]
+                    and profile["system"]["archetype"]["name"] != archetype
+                ):
+                    self.progress.advance(self.task_id)
                     continue
                 if (
                     personality
+                    and "personality" in profile["system"]
                     and profile["system"]["personality"]["name"] != personality
                 ):
+                    self.progress.advance(self.task_id)
                     continue
 
                 yield profile
@@ -250,9 +413,10 @@ class UpdateNetboxIPv6:
         )
 
         if not netbox_device_id:
-            logging.warning(
+            logging.error(
                 f"Could not map {hostname} to a NetBox device/VM (tried IP {primary_ip} and MACs)"
             )
+            self.stats["errors"] += 1
             return ipv6_addresses
 
         # Step 2: Fetch ALL IP records for that Device/VM
@@ -271,7 +435,7 @@ class UpdateNetboxIPv6:
                             IPv6Binding(
                                 hostname=hostname,
                                 interface=nb_intf_name,
-                                address=IPv6Network(address.address, strict=False),
+                                address=IPv6Interface(address.address),
                             )
                         )
                 else:
@@ -288,11 +452,11 @@ class UpdateNetboxIPv6:
         if "ipv6" not in network_data or not network_data["ipv6"].get("enabled"):
             return ipv6_addresses
 
-        print("========")
-        print("#", profile_data["hardware"]["nodename"])
-
         profile_interfaces = network_data.get("interfaces", {})
         hostname = f"{network_data.get('hostname')}.{network_data.get('domainname')}"
+
+        logging.info("")
+        logging.info(f"IPv6 Profile Found:\n{profile_data['filename']}")
 
         for interface_name, profile_interface in profile_interfaces.items():
             if "ipv6addr" in profile_interface:
@@ -301,7 +465,7 @@ class UpdateNetboxIPv6:
                     IPv6Binding(
                         hostname=hostname,
                         interface=interface_name,
-                        address=IPv6Network(ipv6addr, strict=False),
+                        address=IPv6Interface(ipv6addr),
                     )
                 )
 
@@ -309,8 +473,14 @@ class UpdateNetboxIPv6:
 
 
 def main():
-    logging.basicConfig(format="%(levelname)s: %(message)s")
-    coloredlogs.install(fmt="%(levelname)7s: %(message)s")
+    console = Console()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        filename="netbox_sync.log",
+        filemode="w",
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
 
     config = ConfigParser()
     config.read(["netbox_ip_status.cfg.default", "netbox_ip_status.cfg"])
@@ -341,26 +511,19 @@ def main():
 
     args = parser.parse_args()
 
-    if args.local:
-        source = "aquilon"
-    else:
-        source = args.profiles_url_base_path
+    source = "aquilon" if args.local else "url"
 
-    if args.archetype:
-        logging.info(f"Limiting scope to aquilon archetype <{args.archetype}>")
-
-    if args.personality:
-        logging.info(f"Limiting scope to aquilon personality <{args.personality}>")
-
-    UpdateNetboxIPv6(
+    scanner = UpdateNetboxIPv6(
         source=source,
         nb_url=config["NETBOX"]["URL"],
         nb_token=config["NETBOX"]["API_KEY"],
         archetype=args.archetype,
         personality=args.personality,
+        console=console,
     )
 
-    print("Done!")
+    scanner.discover_changes()
+    scanner.export_plan()
 
 
 if __name__ == "__main__":
