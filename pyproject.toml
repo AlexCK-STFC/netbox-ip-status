@@ -8,4 +8,5 @@ dependencies = [
     "coloredlogs>=15.0.1",
     "ipy>=1.1",
     "pynetbox>=7.6.1",
+    "rich>=14.3.3",
 ]

@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from typing import cast
 from urllib.parse import urljoin
 
+import traceback
+
 import coloredlogs
 import pynetbox
 import requests
@@ -17,12 +19,14 @@ from pynetbox.models.dcim import Devices, Interfaces
 from pynetbox.models.ipam import IpAddresses
 from pynetbox.models.virtualization import VirtualMachines
 
+from ipaddress import IPv6Network
+from rich import print
 
 @dataclass(frozen=True)
 class IPv6Binding:
     hostname: str
     interface: str
-    address: str
+    address: IPv6Network
 
 
 class UpdateNetboxIPv6:
@@ -37,8 +41,22 @@ class UpdateNetboxIPv6:
             self.profiles = self.load_profiles_xml(source)
 
         for profile in self.profiles:
-            self.ipv6_aquilon |= self.get_ipv6_aquilon(profile)
-            self.ipv6_netbox |= self.get_ipv6_netbox(profile)
+            profile_ipv6_aq = self.get_ipv6_aquilon(profile)
+            profile_ipv6_nb = self.get_ipv6_netbox(profile)
+            if profile_ipv6_aq or profile_ipv6_nb:
+                print("Profile: ", profile["filename"])
+                # print(f"AQ Interfaces: {profile_ipv6_aq}")
+                # print(f"NB Interfaces: {profile_ipv6_nb}")
+                if profile_ipv6_aq == profile_ipv6_nb:
+                    print("[green]Already Correct![/green]")
+                else:
+                    intersect = profile_ipv6_aq & profile_ipv6_nb
+                    print(f"[yellow]Difference: {profile_ipv6_aq - profile_ipv6_nb}[/yellow]")
+                    if intersect:
+                        print(f"[green]Intersection: {intersect}[/green]")
+                print("========")
+                self.ipv6_aquilon |= profile_ipv6_aq
+                self.ipv6_netbox |= profile_ipv6_nb
 
     def load_profiles_xml(self, base_url: str):
         url = urljoin(base_url.rstrip("/") + "/", "profiles-info.xml")
@@ -71,9 +89,11 @@ class UpdateNetboxIPv6:
 
     def load_profiles_aquilon(self):
         GLOB_PROFILES = "/var/quattor/web/htdocs/profiles/*.json"
-        for filename in glob.glob(GLOB_PROFILES)[:32]:
+        for filename in glob.glob(GLOB_PROFILES):
             with open(filename) as file_handle:
-                yield json.load(file_handle)
+                profile = json.load(file_handle)
+                profile["filename"] = filename
+                yield profile
 
     def get_ipv6_addresses_from_netbox_interface(
         self,
@@ -133,6 +153,9 @@ class UpdateNetboxIPv6:
                     netbox_ip = cast(
                         IpAddresses, self.nb.ipam.ip_addresses.get(address=primary_ip)
                     )
+                    if netbox_ip is None:
+                        logging.warning(f"{interface_name} for {hostname} has IP {primary_ip} which mapped to a netbox None")
+                        continue
                     netbox_primary_interface = cast(
                         Interfaces, netbox_ip.assigned_object
                     )
@@ -151,6 +174,9 @@ class UpdateNetboxIPv6:
                     netbox_ip = cast(
                         IpAddresses, self.nb.ipam.ip_addresses.get(address=primary_ip)
                     )
+                    if netbox_ip is None:
+                        logging.warning(f"{interface_name} for {hostname} has IP {primary_ip} which mapped to a netbox None")
+                        continue
                     netbox_primary_interface = cast(
                         Interfaces, netbox_ip.assigned_object
                     )
@@ -166,9 +192,8 @@ class UpdateNetboxIPv6:
                         IPv6Binding(
                             hostname=hostname,
                             interface=interface_name,
-                            address=str(addr.address),
+                            address=IPv6Network(addr.address, strict=False)),
                         )
-                    )
 
         return ipv6_addresses
 
@@ -180,6 +205,8 @@ class UpdateNetboxIPv6:
         if not profile_data["system"]["network"]["ipv6"]["enabled"]:
             return ipv6_addresses
 
+        print("========")
+        # print("Found IPv6")
         print("#", profile_data["hardware"]["nodename"])
 
         profile_interfaces = profile_data["system"]["network"]["interfaces"]
@@ -197,7 +224,7 @@ class UpdateNetboxIPv6:
                 ipv6addr = profile_interface["ipv6addr"]
                 ipv6_addresses.add(
                     IPv6Binding(
-                        hostname=hostname, interface=interface_name, address=ipv6addr
+                        hostname=hostname, interface=interface_name, address=IPv6Network(ipv6addr, strict=False)
                     )
                 )
 
@@ -205,6 +232,9 @@ class UpdateNetboxIPv6:
 
 
 def main():
+    logging.basicConfig(format="%(levelname)s: %(message)s")
+    coloredlogs.install(fmt="%(levelname)7s: %(message)s")
+
     config = ConfigParser()
     config.read(["netbox_ip_status.cfg.default", "netbox_ip_status.cfg"])
 
@@ -240,14 +270,17 @@ def main():
         nb_token=config["NETBOX"]["API_KEY"],
     )
 
-    print(ipv6_obj.ipv6_aquilon)
-    print(ipv6_obj.ipv6_netbox)
+    print("Done!")
 
-    print(f"Difference: {ipv6_obj.ipv6_aquilon - ipv6_obj.ipv6_netbox}")
-    print(f"Intersection: {ipv6_obj.ipv6_aquilon & ipv6_obj.ipv6_netbox}")
+    # print("Debug:")
 
-    logging.basicConfig(format="%(levelname)s: %(message)s")
-    coloredlogs.install(fmt="%(levelname)7s: %(message)s")
+    # print(ipv6_obj.ipv6_aquilon)
+    # print(ipv6_obj.ipv6_netbox)
+
+    # print(f"Difference: {ipv6_obj.ipv6_aquilon - ipv6_obj.ipv6_netbox}")
+    # print(f"Intersection: {ipv6_obj.ipv6_aquilon & ipv6_obj.ipv6_netbox}")
+
+    
 
     # if opts.debug:
     #    coloredlogs.set_level(logging.DEBUG)
